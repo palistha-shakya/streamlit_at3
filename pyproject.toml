@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "streamlit_crypto_app"
+version = "1.0.0"
+description = "Streamlit app to display live cryptocurrency data and ML predictions"
+authors = [
+    { name="Palistha Shakya", email="palistha.shakya@student.uts.edu.au" }
+]
+requires-python = ">=3.11"
+
+dependencies = [
+    "fastapi==0.111.0",
+    "uvicorn==0.30.1",
+    "pandas==2.2.2",
+    "scikit-learn==1.5.1",
+    "joblib==1.4.2",
+    "streamlit==1.36.0",
+    "requests==2.31.0",
+    "plotly==5.22.0",
+    "xgboost==2.1.0",
+    "lightgbm==4.4.0",
+    "hyperopt==0.2.7",
+    "lime==0.2.0.1",
+    "wandb==0.17.4"
+]
