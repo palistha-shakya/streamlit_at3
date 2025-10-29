@@ -17,8 +17,7 @@ KRAKEN_PAIR = "XXRPZUSD"  # XRP/USD on Kraken (daily candles = interval 1440)
 st.set_page_config(page_title="XRP — Risk & Regimes", layout="wide")
 st.title("XRP — Risk & Regimes (Kraken) + Next-Day HIGH Prediction")
 st.caption(
-    "Different from a simple 7-day CG chart: deeper window from Kraken + risk analytics "
-    "(volatility, ATR, drawdown, SMA regimes). Prediction shows only the number."
+    "Kraken OHLC with risk metrics"
 )
 
 # =======================
@@ -114,13 +113,6 @@ def add_metrics(df: pd.DataFrame) -> pd.DataFrame:
     df["regime"] = np.where(df["sma20"] > df["sma50"], "BULL", "BEAR")
     return df
 
-def top_moves(df: pd.DataFrame, n=10):
-    d = df.dropna(subset=["ret"]).copy()
-    d["return_%"] = d["ret"] * 100
-    best = d.nlargest(n, "return_%")[["time", "open", "high", "low", "close", "return_%"]]
-    worst = d.nsmallest(n, "return_%")[["time", "open", "high", "low", "close", "return_%"]]
-    return best, worst
-
 df = add_metrics(df)
 
 # =======================
@@ -166,13 +158,6 @@ with right:
 
 st.caption("Max drawdown (since window start)")
 st.area_chart(df.set_index("time")[["drawdown"]])
-
-best, worst = top_moves(df, n=10)
-st.subheader("Top 10 Moves")
-st.write("⬆️ Largest Up Days")
-st.dataframe(best, use_container_width=True)
-st.write("⬇️ Largest Down Days")
-st.dataframe(worst, use_container_width=True)
 
 # =======================
 # Prediction (number only)
