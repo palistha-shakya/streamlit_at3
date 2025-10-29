@@ -1,5 +1,5 @@
 # students/xrp.py
-# XRP — Risk & Regimes (Kraken) + Next-Day HIGH Prediction (number-only)
+# XRP — Risk & Regimes (Kraken) + Next-Day HIGH Prediction 
 import os
 import requests
 import numpy as np
@@ -165,3 +165,4 @@ def run_xrp_tab():
 if __name__ == "__main__":
     # Avoid calling set_page_config here to keep it compatible with parent apps
     run_xrp_tab()
+
