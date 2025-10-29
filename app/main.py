@@ -20,5 +20,5 @@ with tab1:
 with tab2:
     run_eth_tab()
 
-with tab:
+with tab3:
     run_xrp_tab()
