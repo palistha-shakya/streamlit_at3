@@ -1,36 +1,39 @@
-# students/aditya_kulkarni.py
-# XRP — Risk & Regimes (Kraken) + Prediction (number only)
+# students/xrp.py
+# XRP — Risk & Regimes (Kraken) + Next-Day HIGH Prediction (number-only)
 import os
-import math
 import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
 import altair as alt
 
-# ---------------------------
+# =======================
 # Config
-# ---------------------------
-API_BASE = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
+# =======================
+API_BASE = os.getenv("API_BASE_URL", "https://at3-xrp-api.onrender.com")
 TOKEN = "xrp"
-KRAKEN_PAIR = "XXRPZUSD"  # XRP/USD on Kraken (daily candles = interval=1440)
+KRAKEN_PAIR = "XXRPZUSD"  # XRP/USD on Kraken (daily candles = interval 1440)
 
+st.set_page_config(page_title="XRP — Risk & Regimes", layout="wide")
 st.title("XRP — Risk & Regimes (Kraken) + Next-Day HIGH Prediction")
-st.caption("Different from CG 7-day view: deeper window, risk analytics (volatility, ATR, drawdown, SMA regimes) from Kraken. Prediction shows only the number.")
+st.caption(
+    "Different from a simple 7-day CG chart: deeper window from Kraken + risk analytics "
+    "(volatility, ATR, drawdown, SMA regimes). Prediction shows only the number."
+)
 
-# ---------------------------
-# Sidebar & inputs
-# ---------------------------
+# =======================
+# Sidebar
+# =======================
 window_days = st.sidebar.selectbox("History window (days)", [90, 180, 365, 730], index=1)
-st.sidebar.caption("Tip: increase the window to see longer regime shifts.")
+st.sidebar.caption("Tip: widen the window to see regime shifts.")
 
-# ---------------------------
-# Data fetch (Kraken) with timezone-safe handling
-# ---------------------------
+# =======================
+# Data fetch (Kraken) — timezone safe
+# =======================
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_kraken_ohlc(pair: str, interval_mins: int = 1440) -> pd.DataFrame:
     """
-    Returns a timezone-naive UTC DataFrame with columns:
+    Return a tz-naive UTC DataFrame with:
     time, open, high, low, close, vwap, volume, count
     """
     url = "https://api.kraken.com/0/public/OHLC"
@@ -39,50 +42,50 @@ def fetch_kraken_ohlc(pair: str, interval_mins: int = 1440) -> pd.DataFrame:
         r.raise_for_status()
         data = r.json()
         if data.get("error"):
-            # Kraken sometimes returns ["EAPI:Rate limit exceeded"] etc.
+            # e.g., ["EAPI:Rate limit exceeded"]
             raise RuntimeError(f"Kraken error: {data['error']}")
         rows = data["result"][pair]
         df = pd.DataFrame(
-            rows,
-            columns=["time", "open", "high", "low", "close", "vwap", "volume", "count"],
+            rows, columns=["time", "open", "high", "low", "close", "vwap", "volume", "count"]
         )
-        # parse epoch seconds as UTC, then drop tz -> naive
+        # Parse epoch seconds as UTC, then drop tz => tz-naive
         df["time"] = pd.to_datetime(df["time"], unit="s", utc=True).dt.tz_convert(None)
         for c in ["open", "high", "low", "close", "vwap", "volume"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         df = df.dropna().sort_values("time").reset_index(drop=True)
+        # Extra guard — ensure tz-naive (some older pandas/envs behave differently)
+        if hasattr(df["time"].dt, "tz") and df["time"].dt.tz is not None:
+            df["time"] = df["time"].dt.tz_localize(None)
         return df
     except Exception as e:
-        # Return empty DF with expected columns so the caller can handle gracefully
+        # Return empty DF with marker for friendly error message
         cols = ["time", "open", "high", "low", "close", "vwap", "volume", "count"]
-        empty = pd.DataFrame(columns=cols)
-        empty.attrs["__error__"] = str(e)
-        return empty
+        out = pd.DataFrame(columns=cols)
+        out.attrs["__error__"] = str(e)
+        return out
 
 full = fetch_kraken_ohlc(KRAKEN_PAIR, interval_mins=1440)
 
-# Display fetch error if any
 fetch_err = full.attrs.get("__error__")
 if fetch_err:
     st.error(f"Failed to load Kraken OHLC: {fetch_err}")
     st.stop()
 
 if full.empty:
-    st.warning("Kraken returned no rows. Try again in a minute (rate limiting) or widen your window.")
+    st.warning("Kraken returned no rows. Try again shortly (rate limiting) or refresh.")
     st.stop()
 
-# Build a timezone-naive UTC cutoff and filter
-cutoff = (pd.Timestamp.utcnow().tz_localize("UTC").tz_convert(None)
-          - pd.Timedelta(days=window_days + 2))
+# Cutoff: make tz-naive UTC then subtract window
+cutoff = pd.Timestamp.now(tz="UTC").tz_localize(None) - pd.Timedelta(days=window_days + 2)
 df = full[full["time"] >= cutoff].copy()
 
 if df.empty:
-    st.info("No rows after filtering by window. Try increasing the window or refreshing the page.")
+    st.info("No rows after filtering by window. Increase the window or refresh the page.")
     st.stop()
 
-# ---------------------------
+# =======================
 # Metrics & helpers
-# ---------------------------
+# =======================
 def add_metrics(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["ret"] = df["close"].pct_change()
@@ -90,7 +93,7 @@ def add_metrics(df: pd.DataFrame) -> pd.DataFrame:
     # 30-day rolling annualised volatility
     df["vol30_annual"] = df["ret"].rolling(30).std() * np.sqrt(365)
 
-    # ATR-14 (Average True Range)
+    # ATR-14
     tr = pd.concat(
         [
             (df["high"] - df["low"]).abs(),
@@ -102,7 +105,7 @@ def add_metrics(df: pd.DataFrame) -> pd.DataFrame:
     df["atr14"] = tr.rolling(14).mean()
     df["atr14_pct"] = (df["atr14"] / df["close"]) * 100.0
 
-    # Drawdown from rolling max close
+    # Drawdown
     df["drawdown"] = (df["close"] / df["close"].cummax() - 1.0) * 100.0
 
     # SMA regimes
@@ -113,16 +116,16 @@ def add_metrics(df: pd.DataFrame) -> pd.DataFrame:
 
 def top_moves(df: pd.DataFrame, n=10):
     d = df.dropna(subset=["ret"]).copy()
-    d["pct"] = d["ret"] * 100
-    best = d.nlargest(n, "pct")[["time", "open", "high", "low", "close", "pct"]]
-    worst = d.nsmallest(n, "pct")[["time", "open", "high", "low", "close", "pct"]]
+    d["return_%"] = d["ret"] * 100
+    best = d.nlargest(n, "return_%")[["time", "open", "high", "low", "close", "return_%"]]
+    worst = d.nsmallest(n, "return_%")[["time", "open", "high", "low", "close", "return_%"]]
     return best, worst
 
 df = add_metrics(df)
 
-# ---------------------------
+# =======================
 # Charts
-# ---------------------------
+# =======================
 st.subheader(f"Daily Candles + Volume — Kraken (last {window_days} days)")
 price = df[["time", "open", "high", "low", "close"]].rename(columns={"time": "Date"})
 volume = df[["time", "volume"]].rename(columns={"time": "Date"})
@@ -145,7 +148,7 @@ vol_chart = (
 
 st.altair_chart((candles & vol_chart).resolve_scale(x="shared"), use_container_width=True)
 
-# Quick KPIs
+# KPIs
 c1, c2, c3 = st.columns(3)
 c1.metric("Last Close (USD)", f"{df['close'].iloc[-1]:,.6f}")
 c2.metric("Curr. Drawdown", f"{df['drawdown'].iloc[-1]:.2f}%")
@@ -167,13 +170,13 @@ st.area_chart(df.set_index("time")[["drawdown"]])
 best, worst = top_moves(df, n=10)
 st.subheader("Top 10 Moves")
 st.write("⬆️ Largest Up Days")
-st.dataframe(best.rename(columns={"pct": "return_%"}), use_container_width=True)
+st.dataframe(best, use_container_width=True)
 st.write("⬇️ Largest Down Days")
-st.dataframe(worst.rename(columns={"pct": "return_%"}), use_container_width=True)
+st.dataframe(worst, use_container_width=True)
 
-# ---------------------------
+# =======================
 # Prediction (number only)
-# ---------------------------
+# =======================
 st.subheader("Predicted Next-Day HIGH (t+1)")
 colA, colB = st.columns(2)
 
@@ -191,16 +194,14 @@ with colA:
             st.error(f"Request failed: {e}")
 
 with colB:
-    # Optional: derive features from last Kraken row to override
     with st.popover("Advanced: derive features from last Kraken row"):
         last = df.iloc[-1]
-        # Your model's features:
-        # ["close","volume","marketCap","high_ret_1","log_marketCap","log_volume"]
-        # We don't have market cap from Kraken; keep 0.0 or fetch CoinGecko if desired.
+        # Your model features: ["close","volume","marketCap","high_ret_1","log_marketCap","log_volume"]
+        # Kraken has no market cap; leave 0.0 or enhance by fetching CG market cap separately.
         features = {
             "close": float(last["close"]),
             "volume": float(last["volume"]),
-            "marketCap": float(0.0),  # optional: replace via CoinGecko latest market cap
+            "marketCap": float(0.0),
             "high_ret_1": float(last["high"] / df["high"].iloc[-2] - 1.0) if len(df) > 1 else 0.0,
             "log_marketCap": float(np.log1p(0.0)),
             "log_volume": float(np.log1p(max(last["volume"], 0.0))),
