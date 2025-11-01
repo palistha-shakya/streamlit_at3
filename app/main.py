@@ -13,7 +13,7 @@ st.title("Crypto Forecast Dashboard")
 st.write("Access real-time data and next-day price predictions for Ethereum.")
 
 # single tab for Ethereum
-tab1, tab2, tab3 = st.tabs(["Bitcoin", "Ethereum,"XRP"])
+tab1, tab2, tab3 = st.tabs(["Bitcoin", "Ethereum","XRP"])
 with tab1:
     run_btc_tab(token="bitcoin")
 
