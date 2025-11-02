@@ -1,10 +1,10 @@
 # students/bitcoin.py
-import streamlit as st
-import pandas as pd
-import numpy as np
-import requests
-import time
 import os
+import time
+import requests
+import numpy as np
+import pandas as pd
+import streamlit as st
 
 # =========================
 # Config & constants
@@ -30,7 +30,7 @@ FEATURES = [
 ID_MAP = {
     "bitcoin": "bitcoin",
     "ethereum": "ethereum",
-    "ripple": "ripple",   # XRP
+    "ripple": "ripple",  # XRP
     "solana": "solana",
 }
 
@@ -38,25 +38,28 @@ COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 KRAKEN_BASE    = "https://api.kraken.com"
 
 # =========================
-# Lightweight local file cache (optional)
+# Lightweight local CSV cache (no pyarrow dependency)
 # =========================
 def _save_tmp(df: pd.DataFrame, path: str):
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        df.to_parquet(path, index=False)
+        df.to_csv(path, index=False)
     except Exception:
         pass
 
 def _load_tmp(path: str) -> pd.DataFrame | None:
     try:
         if os.path.exists(path):
-            return pd.read_parquet(path)
+            # Only parse the typical datetime column if present
+            if "ohlc" in path or "volume" in path:
+                return pd.read_csv(path, parse_dates=["date"])
+            return pd.read_csv(path)
     except Exception:
         return None
     return None
 
 # =========================
-# HTTP helpers (with headers/key/backoff)
+# HTTP helpers (UA, optional CG key, backoff)
 # =========================
 def _rate_limited_get(url, params=None, timeout=30, retries=5, backoff=1.8):
     """GET with exponential backoff; respects Retry-After for 429. Adds UA and optional CoinGecko key."""
@@ -73,10 +76,12 @@ def _rate_limited_get(url, params=None, timeout=30, retries=5, backoff=1.8):
     for i in range(retries):
         try:
             r = requests.get(url, params=params, headers=headers, timeout=timeout)
+            # Common rate limit path
             if r.status_code == 429:
                 wait = int(r.headers.get("Retry-After", 0)) or int(backoff ** (i + 1))
                 time.sleep(wait)
                 continue
+            # Force fallback for 401/403 to Kraken
             if r.status_code in (401, 403):
                 r.raise_for_status()
             r.raise_for_status()
@@ -105,10 +110,51 @@ def _kraken_get(url, params=None, timeout=30, retries=4, backoff=1.8):
 # =========================
 # Data fetchers
 # =========================
+@st.cache_data(ttl=900)
+def fetch_cg_market_chart_fast(coin_id: str, days: str = "7") -> pd.DataFrame:
+    """
+    Fast path: single /market_chart call for close/volume/marketCap.
+    Approximate OHLC via rolling window to avoid /ohlc rate limits.
+    """
+    url = f"{COINGECKO_BASE}/coins/{coin_id}/market_chart"
+    params = {"vs_currency": "usd", "days": days, "interval": "daily"}
+    r = _rate_limited_get(url, params=params, timeout=25, retries=4, backoff=1.8)
+    js = r.json() or {}
+
+    prices = js.get("prices", [])
+    df = pd.DataFrame(prices, columns=["ts", "close"])
+    if df.empty:
+        return pd.DataFrame(columns=["date","open","high","low","close","volume","marketCap"])
+    df["date"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert("UTC").dt.normalize()
+    df.drop(columns=["ts"], inplace=True)
+
+    vols = pd.DataFrame(js.get("total_volumes", []), columns=["ts","volume"])
+    caps = pd.DataFrame(js.get("market_caps", []),     columns=["ts","marketCap"])
+    for d in (vols, caps):
+        if not d.empty:
+            d["date"] = pd.to_datetime(d["ts"], unit="ms", utc=True).dt.tz_convert("UTC").dt.normalize()
+            d.drop(columns=["ts"], inplace=True, errors="ignore")
+
+    if not vols.empty:
+        df = df.merge(vols[["date","volume"]], on="date", how="left")
+    else:
+        df["volume"] = np.nan
+    if not caps.empty:
+        df = df.merge(caps[["date","marketCap"]], on="date", how="left")
+    else:
+        df["marketCap"] = np.nan
+
+    df.sort_values("date", inplace=True)
+    df["open"] = df["close"].shift(1).bfill()
+    df["high"] = df["close"].rolling(3, min_periods=1).max()
+    df["low"]  = df["close"].rolling(3, min_periods=1).min()
+
+    return df[["date","open","high","low","close","volume","marketCap"]]
+
 @st.cache_data(ttl=3600)
 def fetch_coingecko_ohlc(coin_id: str, days="365") -> pd.DataFrame:
-    """CoinGecko OHLC (no volume). Default 365d to avoid rate limit; 'max' possible but slower."""
-    cache_path = f"/tmp/{coin_id}_ohlc_{days}.parquet"
+    """CoinGecko OHLC (no volume). Default 365 to reduce rate limits; 'max' allowed."""
+    cache_path = f"/tmp/{coin_id}_ohlc_{days}.csv"
     cached = _load_tmp(cache_path)
     if cached is not None and len(cached) > 0:
         return cached
@@ -124,20 +170,17 @@ def fetch_coingecko_ohlc(coin_id: str, days="365") -> pd.DataFrame:
         return df
 
     df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close"])
-    df["date"] = (
-        pd.to_datetime(df["ts"], unit="ms", utc=True)
-          .dt.tz_convert("UTC")
-          .dt.normalize()
-    )
-    df = df.drop(columns=["ts"]).drop_duplicates(subset=["date"])
-    df = df[["date", "open", "high", "low", "close"]].sort_values("date").reset_index(drop=True)
+    df["date"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert("UTC").dt.normalize()
+    df.drop(columns=["ts"], inplace=True)
+    df.drop_duplicates(subset=["date"], inplace=True)
+    df = df[["date","open","high","low","close"]].sort_values("date").reset_index(drop=True)
     _save_tmp(df, cache_path)
     return df
 
 @st.cache_data(ttl=3600)
 def fetch_coingecko_volume(coin_id: str, days="365") -> pd.DataFrame:
     """CoinGecko market_chart -> total_volumes + market_caps (daily)."""
-    cache_path = f"/tmp/{coin_id}_volume_{days}.parquet"
+    cache_path = f"/tmp/{coin_id}_volume_{days}.csv"
     cached = _load_tmp(cache_path)
     if cached is not None and len(cached) > 0:
         return cached
@@ -151,28 +194,40 @@ def fetch_coingecko_volume(coin_id: str, days="365") -> pd.DataFrame:
     caps = js.get("market_caps", [])
     df_v = pd.DataFrame(vols, columns=["ts", "volume"])
     df_v["date"] = pd.to_datetime(df_v["ts"], unit="ms", utc=True).dt.tz_convert("UTC").dt.normalize()
-    df_v = df_v.drop(columns=["ts"])
+    df_v.drop(columns=["ts"], inplace=True)
 
     df_c = pd.DataFrame(caps, columns=["ts", "marketCap"])
     df_c["date"] = pd.to_datetime(df_c["ts"], unit="ms", utc=True).dt.tz_convert("UTC").dt.normalize()
-    df_c = df_c.drop(columns=["ts"])
+    df_c.drop(columns=["ts"], inplace=True)
 
     out = pd.merge_asof(
-        df_v.sort_values("date"), df_c.sort_values("date"),
-        on="date", direction="nearest", tolerance=pd.Timedelta("1D")
+        df_v.sort_values("date"),
+        df_c.sort_values("date"),
+        on="date",
+        direction="nearest",
+        tolerance=pd.Timedelta("1D")
     ).sort_values("date").reset_index(drop=True)
 
     _save_tmp(out, cache_path)
     return out
 
 @st.cache_data(ttl=3600)
-def fetch_kraken_ohlc_btc(days: int = 365) -> pd.DataFrame:
+def fetch_kraken_ohlc_btc(days: int | str = 365) -> pd.DataFrame:
     """
     Kraken fallback for BTC (USD, daily interval).
-    pair: XXBTZUSD, interval=1440 (daily). Includes volume.
+    Accepts days as int or str; 'max' or invalid string -> 1825 (~5y).
+    Includes volume.
     """
+    if isinstance(days, str):
+        if days.isdigit():
+            days = int(days)
+        else:
+            days = 1825
+    days = max(int(days), 30)  # minimal 30 days
+
     now = int(time.time())
     since = now - days * 86400
+
     url = f"{KRAKEN_BASE}/0/public/OHLC"
     params = {"pair": "XXBTZUSD", "interval": 1440, "since": since}
     res = _kraken_get(url, params=params)
@@ -244,7 +299,8 @@ def call_predict_api(features: dict) -> float:
     r = requests.get(f"{API_BASE}/predict/bitcoin", params=features, timeout=25)
     r.raise_for_status()
     js = r.json()
-    return float(js["prediction_next_day_high_usd"])
+    # align with your backend key
+    return float(js.get("prediction_next_day_high_usd") or js.get("prediction") or js.get("predicted_high") or js.get("predicted_next_day_high"))
 
 # =========================
 # UI entry
@@ -256,35 +312,48 @@ def render(token: str):
         st.info("This tab is for Bitcoin. Change token to Bitcoin to enable prediction.")
         return
 
-
-    rng = st.selectbox(
-        "History range",
-        ["90 days", "180 days", "365 days", "5 years", "max (slow)"],
-        index=1
+    # Data mode
+    mode = st.radio(
+        "Data mode",
+        ["Fast (market_chart, approximate OHLC)", "Full (OHLC + fallback)"],
+        index=0,
+        help="Fast: single API call, very low rate-limit risk. Full: true OHLC with Kraken fallback."
     )
-    days_map = {
-        "90 days": "90",
-        "180 days": "180",
-        "365 days": "365",
-        "5 years": "1825",
-        "max (slow)": "max",
-    }
+
+    # History window
+    if mode.startswith("Fast"):
+        rng = st.selectbox("History range", ["7 days", "14 days", "30 days", "90 days"], index=2)
+        days_map = {"7 days":"7","14 days":"14","30 days":"30","90 days":"90"}
+    else:
+        rng = st.selectbox("History range", ["90 days", "180 days", "365 days", "5 years", "max (slow)"], index=1)
+        days_map = {"90 days":"90","180 days":"180","365 days":"365","5 years":"1825","max (slow)":"max"}
     days = days_map[rng]
 
+    # Fetch data
+    if mode.startswith("Fast"):
+        with st.spinner(f"Fetching market_chart (fast) {days}…"):
+            try:
+                df = fetch_cg_market_chart_fast(ID_MAP[token], days=days)
+                if df.empty or len(df) < 5:
+                    st.warning("Too few rows from market_chart. Try a longer window.")
+                    st.stop()
+            except Exception as e:
+                st.error(f"Fast mode failed: {e}")
+                st.stop()
+    else:
+        with st.spinner(f"Fetching OHLC & volume ({days})..."):
+            try:
+                ohlc = fetch_coingecko_ohlc(ID_MAP[token], days=days)
+                vol  = fetch_coingecko_volume(ID_MAP[token], days=days)
+                df = ohlc.merge(vol, on="date", how="inner")
+                if len(df) < 10:
+                    raise RuntimeError("Too few rows after merge, triggering fallback.")
+            except Exception as e:
+                st.info(f"CoinGecko not available ({str(e)[:80]}). Falling back to Kraken…")
+                fallback_days = int(days) if isinstance(days, str) and days.isdigit() else (int(days) if isinstance(days, int) else 1825)
+                df = fetch_kraken_ohlc_btc(days=fallback_days)
 
-    with st.spinner(f"Fetching OHLC & volume ({days})..."):
-        try:
-            ohlc = fetch_coingecko_ohlc(ID_MAP[token], days=days)
-            vol  = fetch_coingecko_volume(ID_MAP[token], days=days)
-            df = ohlc.merge(vol, on="date", how="inner")
-            if len(df) < 10:
-                raise RuntimeError("Too few rows after merge, triggering fallback.")
-        except Exception as e:
-            st.info(f"CoinGecko not available ({str(e)[:80]}). Falling back to Kraken…")
-            fallback_days = 365 if (not days.isdigit()) else int(days)
-            df = fetch_kraken_ohlc_btc(days=fallback_days)
-
-
+    # Charts
     st.subheader("Historical price (Close) and Volume")
     c1, c2 = st.columns(2)
     with c1:
@@ -292,7 +361,7 @@ def render(token: str):
     with c2:
         st.area_chart(df.set_index("date")["volume"], height=260)
 
-
+    # Features + cleaning
     df_feat = build_features(df)
     df_feat = df_feat.replace([np.inf, -np.inf], np.nan).fillna(method="ffill").dropna()
     if df_feat.empty:
@@ -308,21 +377,22 @@ def render(token: str):
     st.caption("Latest feature snapshot used for prediction:")
     st.dataframe(pd.DataFrame([feats]), use_container_width=True)
 
+    # Prediction (button-triggered to avoid hitting API on every rerender)
+    st.subheader("Predict Next-Day HIGH (t+1)")
+    if st.button("Predict"):
+        try:
+            with st.spinner("Calling API for next-day HIGH prediction..."):
+                pred = call_predict_api(feats)
+            st.success(f"Predicted next-day HIGH (USD): {pred:,.2f}")
+        except Exception as e:
+            st.error(f"Prediction failed: {e}")
 
-    try:
-        with st.spinner("Calling API for next-day HIGH prediction..."):
-            pred = call_predict_api(feats)
-        st.success(f"Predicted next-day HIGH (USD): {pred:,.2f}")
-    except Exception as e:
-        st.error(f"Prediction failed: {e}")
-
-
+    # Debug
     with st.expander("Debug • Connectivity & cache", expanded=False):
         st.write("Resolved API_BASE:", API_BASE)
-        st.write("Rows:", len(df), "| Date range:", df["date"].min() if len(df) else None, "→", df["date"].max() if len(df) else None)
+        st.write("Rows:", len(df), "| Date range:", (df["date"].min() if len(df) else None), "→", (df["date"].max() if len(df) else None))
         try:
             hr = requests.get(f"{API_BASE}/health/", timeout=10)
             st.write("/health status:", hr.status_code, hr.text[:200])
         except Exception as e:
             st.error(f"/health failed: {e}")
-
