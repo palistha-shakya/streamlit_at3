@@ -30,17 +30,16 @@ ID_MAP = {
     "solana": "solana",
 }
 
-def fetch_coingecko_ohlc(token_id: str, days="max"):
-    """Returns DataFrame: date, open, high, low, close (daily)."""
-    url = f"https://api.coingecko.com/api/v3/coins/{token_id}/ohlc"
-    params = {"vs_currency": "usd", "days": days}
-    r = requests.get(url, params=params, timeout=30)
+def fetch_latest_price_coindesk(token="BTC"):
+    """
+    Fetch current USD price from Coindesk (no API key needed)
+    token: "BTC", "ETH", etc.
+    """
+    url = f"https://api.coindesk.com/v1/bpi/currentprice/{token}.json"
+    r = requests.get(url, timeout=10)
     r.raise_for_status()
-    data = r.json()  # [[ts_ms, o, h, l, c], ...]
-    df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close"])
-    df["date"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert("UTC").dt.normalize()
-    df = df.drop(columns=["ts"]).sort_values("date").reset_index(drop=True)
-    return df
+    data = r.json()
+    return data["bpi"]["USD"]["rate_float"]
 
 def fetch_coingecko_volume(token_id: str, days="max"):
     """Returns DataFrame: date, volume, marketCap (daily)."""
@@ -158,3 +157,4 @@ def render(token: str):
         st.success(f"Predicted next-day HIGH (USD): {pred:,.2f}")
     except Exception as e:
         st.error(f"Prediction failed: {e}")
+
