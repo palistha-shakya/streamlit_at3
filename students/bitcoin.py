@@ -4,15 +4,14 @@ import pandas as pd
 import numpy as np
 import requests
 import time
+import os
 from datetime import datetime, timezone
 import math
-
 
 API_BASE = st.secrets.get(
     "API_BASE",
     "https://three6120-25sp-group27-25402328-at3-api.onrender.com"
 )
-
 
 FEATURES = [
     "close_pct", "high_pct", "volume_pct", "high_low_range_pct",
@@ -27,7 +26,6 @@ FEATURES = [
     "dow_sin", "dow_cos",
 ]
 
-
 ID_MAP = {
     "bitcoin": "bitcoin",
     "ethereum": "ethereum",
@@ -37,49 +35,84 @@ ID_MAP = {
 
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 
-@st.cache_data(ttl=3600)
-def fetch_coingecko_ohlc(coin_id: str, days="max", vs_currency="usd") -> pd.DataFrame:
+def _save_tmp(df: pd.DataFrame, path: str):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        df.to_parquet(path, index=False)
+    except Exception:
+        pass
 
-    url = f"{COINGECKO_BASE}/coins/{coin_id}/ohlc"
-    params = {"vs_currency": vs_currency, "days": days}
+def _load_tmp(path: str) -> pd.DataFrame | None:
+    try:
+        if os.path.exists(path):
+            return pd.read_parquet(path)
+    except Exception:
+        return None
+    return None
+
+def _rate_limited_get(url, params=None, timeout=30, retries=5, backoff=1.8):
+    """GET with exponential backoff; respects Retry-After for 429."""
+    params = params or {}
     last_err = None
-    for i in range(4):
+    for i in range(retries):
         try:
-            r = requests.get(url, params=params, timeout=30)
-            if r.status_code == 429 and i < 3:
-
-                time.sleep(int(r.headers.get("Retry-After", 2)))
+            r = requests.get(url, params=params, timeout=timeout)
+            if r.status_code == 429:
+                wait = int(r.headers.get("Retry-After", 0)) or int(backoff ** (i + 1))
+                time.sleep(wait)
                 continue
             r.raise_for_status()
-            data = r.json()
-            break
+            return r
         except Exception as e:
             last_err = e
-            time.sleep(1.5 ** (i + 1))
-    else:
-        raise last_err
+            time.sleep(backoff ** (i + 1))
+    raise last_err
+
+@st.cache_data(ttl=3600)
+def fetch_coingecko_ohlc(coin_id: str, days="365") -> pd.DataFrame:
+
+    cache_path = f"/tmp/{coin_id}_ohlc_{days}.parquet"
+
+
+    cached = _load_tmp(cache_path)
+    if cached is not None and len(cached) > 0:
+        return cached
+
+    url = f"{COINGECKO_BASE}/coins/{coin_id}/ohlc"
+    params = {"vs_currency": "usd", "days": days}
+    r = _rate_limited_get(url, params=params, timeout=40, retries=6, backoff=2.0)
+    data = r.json()
 
     if not data:
-        return pd.DataFrame(columns=["date", "open", "high", "low", "close"])
+        df = pd.DataFrame(columns=["date", "open", "high", "low", "close"])
+        _save_tmp(df, cache_path)
+        return df
 
     df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close"])
-
     df["date"] = (
         pd.to_datetime(df["ts"], unit="ms", utc=True)
           .dt.tz_convert("UTC")
           .dt.normalize()
     )
     df = df.drop(columns=["ts"]).drop_duplicates(subset=["date"])
-    return df[["date", "open", "high", "low", "close"]].sort_values("date").reset_index(drop=True)
+    df = df[["date", "open", "high", "low", "close"]].sort_values("date").reset_index(drop=True)
+
+    _save_tmp(df, cache_path)
+    return df
 
 @st.cache_data(ttl=3600)
-def fetch_coingecko_volume(token_id: str, days="max") -> pd.DataFrame:
+def fetch_coingecko_volume(coin_id: str, days="365") -> pd.DataFrame:
     """/coins/{id}/market_chart -> total_volumes & market_caps（按天）"""
-    url = f"{COINGECKO_BASE}/coins/{token_id}/market_chart"
+    cache_path = f"/tmp/{coin_id}_volume_{days}.parquet"
+    cached = _load_tmp(cache_path)
+    if cached is not None and len(cached) > 0:
+        return cached
+
+    url = f"{COINGECKO_BASE}/coins/{coin_id}/market_chart"
     params = {"vs_currency": "usd", "days": days, "interval": "daily"}
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
+    r = _rate_limited_get(url, params=params, timeout=40, retries=6, backoff=2.0)
     js = r.json()
+
     vols = js.get("total_volumes", [])
     caps = js.get("market_caps", [])
     df_v = pd.DataFrame(vols, columns=["ts", "volume"])
@@ -93,14 +126,12 @@ def fetch_coingecko_volume(token_id: str, days="max") -> pd.DataFrame:
     out = pd.merge_asof(
         df_v.sort_values("date"), df_c.sort_values("date"),
         on="date", direction="nearest", tolerance=pd.Timedelta("1D")
-    )
-    return out.sort_values("date").reset_index(drop=True)
+    ).sort_values("date").reset_index(drop=True)
+
+    _save_tmp(out, cache_path)
+    return out
 
 def fetch_latest_price_coindesk(token="BTC"):
-    """
-
-    token: "BTC", "ETH", ...
-    """
     url = f"https://api.coindesk.com/v1/bpi/currentprice/{token}.json"
     r = requests.get(url, timeout=10)
     r.raise_for_status()
@@ -108,16 +139,12 @@ def fetch_latest_price_coindesk(token="BTC"):
     return data["bpi"]["USD"]["rate_float"]
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy().sort_values("date").reset_index(drop=True)
 
-    df = df.copy()
-    df = df.sort_values("date").reset_index(drop=True)
-
-    # pct changes
-    df["close_pct"] = df["close"].pct_change()
-    df["high_pct"]  = df["high"].pct_change()
+    df["close_pct"]  = df["close"].pct_change()
+    df["high_pct"]   = df["high"].pct_change()
     df["volume_pct"] = df["volume"].pct_change()
 
-    # ranges & rolling stats
     df["high_low_range_pct"] = (df["high"] - df["low"]) / df["close"].shift(1).replace(0, np.nan)
 
     df["range_roll3_mean"] = df["high_low_range_pct"].rolling(3).mean()
@@ -131,16 +158,13 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
     df["volume_log1p"] = np.log1p(df["volume"].clip(lower=0))
 
-    # lags
     for k in [1, 3, 7]:
         df[f"close_pct_lag{k}"] = df["close_pct"].shift(k)
         df[f"high_pct_lag{k}"]  = df["high_pct"].shift(k)
 
-    # zscores
     df["range_zscore_7"]  = (df["high_low_range_pct"] - df["high_low_range_pct"].rolling(7).mean()) / (df["high_low_range_pct"].rolling(7).std() + 1e-12)
     df["range_zscore_14"] = (df["high_low_range_pct"] - df["high_low_range_pct"].rolling(14).mean()) / (df["high_low_range_pct"].rolling(14).std() + 1e-12)
 
-    # ATR%
     tr = pd.concat([
         (df["high"] - df["low"]).abs(),
         (df["high"] - df["close"].shift(1)).abs(),
@@ -149,16 +173,14 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df["atr_pct"] = tr / df["close"].shift(1).replace(0, np.nan)
     df["atr_pct_roll7"] = df["atr_pct"].rolling(7).mean()
 
-    # Day-of-week encoding
-    dow = df["date"].dt.dayofweek  # 0=Mon ... 6=Sun
+    dow = df["date"].dt.dayofweek
     df["dow_sin"] = np.sin(2 * np.pi * dow / 7)
     df["dow_cos"] = np.cos(2 * np.pi * dow / 7)
 
     return df
 
 def call_predict_api(features: dict) -> float:
-    url = f"{API_BASE}/predict/bitcoin"
-    r = requests.get(url, params=features, timeout=20)
+    r = requests.get(f"{API_BASE}/predict/bitcoin", params=features, timeout=25)
     r.raise_for_status()
     js = r.json()
     return float(js["prediction_next_day_high_usd"])
@@ -171,9 +193,29 @@ def render(token: str):
         return
 
 
-    with st.spinner("Fetching OHLC and volume from CoinGecko..."):
-        ohlc = fetch_coingecko_ohlc(ID_MAP[token], days="max")
-        vol  = fetch_coingecko_volume(ID_MAP[token], days="max")
+    rng = st.selectbox(
+        "History range",
+        ["90 days", "180 days", "365 days", "5 years", "max (slow)"],
+        index=2
+    )
+    days_map = {
+        "90 days": "90",
+        "180 days": "180",
+        "365 days": "365",
+        "5 years": "1825",
+        "max (slow)": "max",
+    }
+    days = days_map[rng]
+
+
+    with st.spinner(f"Fetching OHLC & volume from CoinGecko ({days})..."):
+        try:
+            ohlc = fetch_coingecko_ohlc(ID_MAP[token], days=days)
+            vol  = fetch_coingecko_volume(ID_MAP[token], days=days)
+        except Exception as e:
+            st.error(f"Data fetch failed (maybe rate limited): {e}")
+            st.stop()
+
         df = ohlc.merge(vol, on="date", how="inner")
 
 
@@ -184,14 +226,13 @@ def render(token: str):
     with c2:
         st.area_chart(df.set_index("date")["volume"], height=260)
 
-
+ 
     df_feat = build_features(df)
     df_feat = df_feat.replace([np.inf, -np.inf], np.nan).fillna(method="ffill").dropna()
     if df_feat.empty:
-        st.error("Not enough data to build features. Please try again later.")
+        st.error("Not enough data to build features. Try a longer history range.")
         return
     last = df_feat.iloc[-1].copy()
-
 
     feats = {
         k: float(np.nan_to_num(last.get(k, np.nan), nan=0.0, posinf=0.0, neginf=0.0))
@@ -210,10 +251,12 @@ def render(token: str):
         st.error(f"Prediction failed: {e}")
 
 
-    with st.expander("Debug • Data fetch sanity check", expanded=False):
-        st.write("OHLC rows:", len(ohlc), "Volume rows:", len(vol))
-        st.dataframe(ohlc.tail(3))
-        st.dataframe(vol.tail(3))
-
-
-
+    with st.expander("Debug • Connectivity & cache", expanded=False):
+        st.write("Resolved API_BASE:", API_BASE)
+        st.write("OHLC rows:", len(ohlc), "| Volume rows:", len(vol))
+        st.write("Last OHLC date:", ohlc["date"].max() if len(ohlc) else None)
+        try:
+            hr = requests.get(f"{API_BASE}/health/", timeout=10)
+            st.write("/health status:", hr.status_code, hr.text[:200])
+        except Exception as e:
+            st.error(f"/health failed: {e}")
