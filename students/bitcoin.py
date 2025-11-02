@@ -3,48 +3,15 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
+import time
 from datetime import datetime, timezone
 import math
-import time
-
-COINGECKO_BASE = "https://api.coingecko.com/api/v3"
-
-@st.cache_data(ttl=3600)
-def fetch_coingecko_ohlc(coin_id: str, days="max", vs_currency="usd") -> pd.DataFrame:
-    """
-    CoinGecko /coins/{id}/ohlc
-    returns [[timestamp(ms), open, high, low, close], ...]
-    NOTE: no volume here; we merge with market_chart volume separately.
-    """
-    url = f"{COINGECKO_BASE}/coins/{coin_id}/ohlc"
-
-    for i in range(4):
-        r = requests.get(url, params={"vs_currency": vs_currency, "days": days}, timeout=30)
-        if r.status_code == 429 and i < 3:
-            time.sleep(int(r.headers.get("Retry-After", 2)))
-            continue
-        r.raise_for_status()
-        data = r.json()
-        break
-
-    if not data:
-        return pd.DataFrame(columns=["date", "open", "high", "low", "close"])
-
-    df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close"])
-
-    df["date"] = (
-        pd.to_datetime(df["ts"], unit="ms", utc=True)
-          .dt.tz_convert("UTC")
-          .dt.normalize()
-    )
-    df = df.drop(columns=["ts"]).drop_duplicates(subset=["date"])
-    return df[["date", "open", "high", "low", "close"]].sort_values("date").reset_index(drop=True)
 
 
-
-
-
-API_BASE = st.secrets.get("API_BASE", "https://three6120-25sp-group27-25402328-at3-api.onrender.com")
+API_BASE = st.secrets.get(
+    "API_BASE",
+    "https://three6120-25sp-group27-25402328-at3-api.onrender.com"
+)
 
 
 FEATURES = [
@@ -60,6 +27,7 @@ FEATURES = [
     "dow_sin", "dow_cos",
 ]
 
+
 ID_MAP = {
     "bitcoin": "bitcoin",
     "ethereum": "ethereum",
@@ -67,20 +35,47 @@ ID_MAP = {
     "solana": "solana",
 }
 
-def fetch_latest_price_coindesk(token="BTC"):
-    """
-    Fetch current USD price from Coindesk (no API key needed)
-    token: "BTC", "ETH", etc.
-    """
-    url = f"https://api.coindesk.com/v1/bpi/currentprice/{token}.json"
-    r = requests.get(url, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    return data["bpi"]["USD"]["rate_float"]
+COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 
-def fetch_coingecko_volume(token_id: str, days="max"):
-    """Returns DataFrame: date, volume, marketCap (daily)."""
-    url = f"https://api.coingecko.com/api/v3/coins/{token_id}/market_chart"
+@st.cache_data(ttl=3600)
+def fetch_coingecko_ohlc(coin_id: str, days="max", vs_currency="usd") -> pd.DataFrame:
+
+    url = f"{COINGECKO_BASE}/coins/{coin_id}/ohlc"
+    params = {"vs_currency": vs_currency, "days": days}
+    last_err = None
+    for i in range(4):
+        try:
+            r = requests.get(url, params=params, timeout=30)
+            if r.status_code == 429 and i < 3:
+
+                time.sleep(int(r.headers.get("Retry-After", 2)))
+                continue
+            r.raise_for_status()
+            data = r.json()
+            break
+        except Exception as e:
+            last_err = e
+            time.sleep(1.5 ** (i + 1))
+    else:
+        raise last_err
+
+    if not data:
+        return pd.DataFrame(columns=["date", "open", "high", "low", "close"])
+
+    df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close"])
+
+    df["date"] = (
+        pd.to_datetime(df["ts"], unit="ms", utc=True)
+          .dt.tz_convert("UTC")
+          .dt.normalize()
+    )
+    df = df.drop(columns=["ts"]).drop_duplicates(subset=["date"])
+    return df[["date", "open", "high", "low", "close"]].sort_values("date").reset_index(drop=True)
+
+@st.cache_data(ttl=3600)
+def fetch_coingecko_volume(token_id: str, days="max") -> pd.DataFrame:
+    """/coins/{id}/market_chart -> total_volumes & market_caps（按天）"""
+    url = f"{COINGECKO_BASE}/coins/{token_id}/market_chart"
     params = {"vs_currency": "usd", "days": days, "interval": "daily"}
     r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
@@ -94,14 +89,26 @@ def fetch_coingecko_volume(token_id: str, days="max"):
     df_c = pd.DataFrame(caps, columns=["ts", "marketCap"])
     df_c["date"] = pd.to_datetime(df_c["ts"], unit="ms", utc=True).dt.tz_convert("UTC").dt.normalize()
     df_c = df_c.drop(columns=["ts"])
+
     out = pd.merge_asof(
         df_v.sort_values("date"), df_c.sort_values("date"),
         on="date", direction="nearest", tolerance=pd.Timedelta("1D")
     )
     return out.sort_values("date").reset_index(drop=True)
 
+def fetch_latest_price_coindesk(token="BTC"):
+    """
+
+    token: "BTC", "ETH", ...
+    """
+    url = f"https://api.coindesk.com/v1/bpi/currentprice/{token}.json"
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    return data["bpi"]["USD"]["rate_float"]
+
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Given daily OHLCV df, compute model FEATURES on last row."""
+
     df = df.copy()
     df = df.sort_values("date").reset_index(drop=True)
 
@@ -147,7 +154,6 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df["dow_sin"] = np.sin(2 * np.pi * dow / 7)
     df["dow_cos"] = np.cos(2 * np.pi * dow / 7)
 
-
     return df
 
 def call_predict_api(features: dict) -> float:
@@ -170,6 +176,7 @@ def render(token: str):
         vol  = fetch_coingecko_volume(ID_MAP[token], days="max")
         df = ohlc.merge(vol, on="date", how="inner")
 
+
     st.subheader("Historical price (Close) and Volume")
     c1, c2 = st.columns(2)
     with c1:
@@ -179,10 +186,17 @@ def render(token: str):
 
 
     df_feat = build_features(df)
+    df_feat = df_feat.replace([np.inf, -np.inf], np.nan).fillna(method="ffill").dropna()
+    if df_feat.empty:
+        st.error("Not enough data to build features. Please try again later.")
+        return
     last = df_feat.iloc[-1].copy()
 
 
-    feats = {k: float(last[k]) for k in FEATURES}
+    feats = {
+        k: float(np.nan_to_num(last.get(k, np.nan), nan=0.0, posinf=0.0, neginf=0.0))
+        for k in FEATURES
+    }
 
     st.caption("Latest feature snapshot used for prediction:")
     st.dataframe(pd.DataFrame([feats]), use_container_width=True)
@@ -194,5 +208,12 @@ def render(token: str):
         st.success(f"Predicted next-day HIGH (USD): {pred:,.2f}")
     except Exception as e:
         st.error(f"Prediction failed: {e}")
+
+
+    with st.expander("Debug • Data fetch sanity check", expanded=False):
+        st.write("OHLC rows:", len(ohlc), "Volume rows:", len(vol))
+        st.dataframe(ohlc.tail(3))
+        st.dataframe(vol.tail(3))
+
 
 
