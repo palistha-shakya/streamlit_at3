@@ -5,6 +5,43 @@ import numpy as np
 import requests
 from datetime import datetime, timezone
 import math
+import time
+
+COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+
+@st.cache_data(ttl=3600)
+def fetch_coingecko_ohlc(coin_id: str, days="max", vs_currency="usd") -> pd.DataFrame:
+    """
+    CoinGecko /coins/{id}/ohlc
+    returns [[timestamp(ms), open, high, low, close], ...]
+    NOTE: no volume here; we merge with market_chart volume separately.
+    """
+    url = f"{COINGECKO_BASE}/coins/{coin_id}/ohlc"
+
+    for i in range(4):
+        r = requests.get(url, params={"vs_currency": vs_currency, "days": days}, timeout=30)
+        if r.status_code == 429 and i < 3:
+            time.sleep(int(r.headers.get("Retry-After", 2)))
+            continue
+        r.raise_for_status()
+        data = r.json()
+        break
+
+    if not data:
+        return pd.DataFrame(columns=["date", "open", "high", "low", "close"])
+
+    df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close"])
+
+    df["date"] = (
+        pd.to_datetime(df["ts"], unit="ms", utc=True)
+          .dt.tz_convert("UTC")
+          .dt.normalize()
+    )
+    df = df.drop(columns=["ts"]).drop_duplicates(subset=["date"])
+    return df[["date", "open", "high", "low", "close"]].sort_values("date").reset_index(drop=True)
+
+
+
 
 
 API_BASE = st.secrets.get("API_BASE", "https://three6120-25sp-group27-25402328-at3-api.onrender.com")
@@ -157,4 +194,5 @@ def render(token: str):
         st.success(f"Predicted next-day HIGH (USD): {pred:,.2f}")
     except Exception as e:
         st.error(f"Prediction failed: {e}")
+
 
