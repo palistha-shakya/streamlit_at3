@@ -30,17 +30,22 @@ ID_MAP = {
     "solana": "solana",
 }
 
-def fetch_coingecko_ohlc(token_id: str, days="max"):
+def fetch_coingecko_ohlc(token_id: str, days="90"):
     """Returns DataFrame: date, open, high, low, close (daily)."""
     url = f"https://api.coingecko.com/api/v3/coins/{token_id}/ohlc"
     params = {"vs_currency": "usd", "days": days}
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    data = r.json()  # [[ts_ms, o, h, l, c], ...]
-    df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close"])
-    df["date"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert("UTC").dt.normalize()
-    df = df.drop(columns=["ts"]).sort_values("date").reset_index(drop=True)
-    return df
+    try:
+        r = requests.get(url, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close"])
+        df["date"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert("UTC").dt.normalize()
+        df = df.drop(columns=["ts"]).sort_values("date").reset_index(drop=True)
+        return df
+    except requests.exceptions.RequestException as e:
+        st.error(f"Failed to fetch CoinGecko OHLC data: {e}")
+        return pd.DataFrame()
+
 
 def fetch_coingecko_volume(token_id: str, days="max"):
     """Returns DataFrame: date, volume, marketCap (daily)."""
