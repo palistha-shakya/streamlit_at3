@@ -5,6 +5,8 @@ import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # =========================
 # Config & constants
@@ -50,13 +52,34 @@ def _save_tmp(df: pd.DataFrame, path: str):
 def _load_tmp(path: str) -> pd.DataFrame | None:
     try:
         if os.path.exists(path):
-            # Only parse the typical datetime column if present
-            if "ohlc" in path or "volume" in path:
+            # typical date column for OHLC/volume caches
+            if path.endswith(".csv"):
                 return pd.read_csv(path, parse_dates=["date"])
             return pd.read_csv(path)
     except Exception:
         return None
     return None
+
+# =========================
+# HTTP session with retries
+# =========================
+@st.cache_resource
+def _http_session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=1.5,
+        status_forcelist=(429, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "POST"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    s.headers.update({"User-Agent": "streamlit-at3-group27/1.0 (+https://appat3-group-27.streamlit.app)"})
+    return s
 
 # =========================
 # HTTP helpers (UA, optional CG key, backoff)
@@ -66,24 +89,20 @@ def _rate_limited_get(url, params=None, timeout=30, retries=5, backoff=1.8):
     params = params or {}
     last_err = None
     cg_key = st.secrets.get("COINGECKO_API_KEY", None)
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "streamlit-at3-group27/1.0 (+https://appat3-group-27.streamlit.app)"
-    }
+    headers = {"Accept": "application/json"}
     if cg_key:
         headers["x-cg-pro-api-key"] = cg_key
 
+    session = _http_session()
     for i in range(retries):
         try:
-            r = requests.get(url, params=params, headers=headers, timeout=timeout)
-            # Common rate limit path
+            r = session.get(url, params=params, headers=headers, timeout=timeout)
             if r.status_code == 429:
                 wait = int(r.headers.get("Retry-After", 0)) or int(backoff ** (i + 1))
                 time.sleep(wait)
                 continue
-            # Force fallback for 401/403 to Kraken
             if r.status_code in (401, 403):
-                r.raise_for_status()
+                r.raise_for_status()  # trigger fallback
             r.raise_for_status()
             return r
         except Exception as e:
@@ -94,9 +113,10 @@ def _rate_limited_get(url, params=None, timeout=30, retries=5, backoff=1.8):
 def _kraken_get(url, params=None, timeout=30, retries=4, backoff=1.8):
     params = params or {}
     last_err = None
+    session = _http_session()
     for i in range(retries):
         try:
-            r = requests.get(url, params=params, timeout=timeout)
+            r = session.get(url, params=params, timeout=timeout)
             r.raise_for_status()
             js = r.json()
             if js.get("error"):
@@ -293,14 +313,61 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # =========================
-# API call to your FastAPI
+# API warm-up & prediction
 # =========================
+def _warm_up_api(base: str):
+    """Ping Render app to wake cold start; tolerate failures."""
+    session = _http_session()
+    try:
+        for path in ["", "/", "/health", "/health/"]:
+            try:
+                session.get(f"{base}{path}", timeout=8)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+def _compact_features(feats: dict, ndigits: int = 6) -> dict:
+    out = {}
+    for k, v in feats.items():
+        try:
+            out[k] = float(round(float(v), ndigits))
+        except Exception:
+            out[k] = 0.0
+    return out
+
 def call_predict_api(features: dict) -> float:
-    r = requests.get(f"{API_BASE}/predict/bitcoin", params=features, timeout=25)
-    r.raise_for_status()
-    js = r.json()
-    # align with your backend key
-    return float(js.get("prediction_next_day_high_usd") or js.get("prediction") or js.get("predicted_high") or js.get("predicted_next_day_high"))
+    session = _http_session()
+    params = _compact_features(features, ndigits=6)
+
+    # Warm up (Render cold start)
+    _warm_up_api(API_BASE)
+
+    # Try GET first (assignment spec)
+    try:
+        r = session.get(f"{API_BASE}/predict/bitcoin", params=params, timeout=60)
+        if r.ok:
+            js = r.json()
+            return float(
+                js.get("prediction_next_day_high_usd")
+                or js.get("prediction")
+                or js.get("predicted_high")
+                or js.get("predicted_next_day_high")
+            )
+    except Exception:
+        pass
+
+    # Fallback: POST
+    r = session.post(f"{API_BASE}/predict/bitcoin", json=params, timeout=60)
+    if r.ok:
+        js = r.json()
+        return float(
+            js.get("prediction_next_day_high_usd")
+            or js.get("prediction")
+            or js.get("predicted_high")
+            or js.get("predicted_next_day_high")
+        )
+    raise RuntimeError(f"API {r.status_code}: {r.text[:300]}")
 
 # =========================
 # UI entry
@@ -317,7 +384,7 @@ def render(token: str):
         "Data mode",
         ["Fast (market_chart, approximate OHLC)", "Full (OHLC + fallback)"],
         index=0,
-        help="Fast: single API call, very low rate-limit risk. Full: true OHLC with Kraken fallback."
+        help="Fast: single API call, low rate-limit risk. Full: true OHLC with Kraken fallback."
     )
 
     # History window
@@ -377,11 +444,11 @@ def render(token: str):
     st.caption("Latest feature snapshot used for prediction:")
     st.dataframe(pd.DataFrame([feats]), use_container_width=True)
 
-    # Prediction (button-triggered to avoid hitting API on every rerender)
+    # Prediction (button-triggered)
     st.subheader("Predict Next-Day HIGH (t+1)")
     if st.button("Predict"):
         try:
-            with st.spinner("Calling API for next-day HIGH prediction..."):
+            with st.spinner("Calling API for next-day HIGH prediction…"):
                 pred = call_predict_api(feats)
             st.success(f"Predicted next-day HIGH (USD): {pred:,.2f}")
         except Exception as e:
@@ -392,7 +459,7 @@ def render(token: str):
         st.write("Resolved API_BASE:", API_BASE)
         st.write("Rows:", len(df), "| Date range:", (df["date"].min() if len(df) else None), "→", (df["date"].max() if len(df) else None))
         try:
-            hr = requests.get(f"{API_BASE}/health/", timeout=10)
+            hr = _http_session().get(f"{API_BASE}/health/", timeout=10)
             st.write("/health status:", hr.status_code, hr.text[:200])
         except Exception as e:
             st.error(f"/health failed: {e}")
